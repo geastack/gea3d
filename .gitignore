@@ -1,0 +1,13 @@
+# dependencies
+node_modules/
+
+# temporary pinned compiler dist (extracted, regenerable, wiped by fold cleanup)
+.pinned-geatsc/
+
+# build artifacts
+dist/
+*.wasm
+*.bin
+
+# OS
+.DS_Store

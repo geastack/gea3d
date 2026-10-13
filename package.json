@@ -1,0 +1,37 @@
+{
+  "name": "@geastack/gea3d",
+  "version": "0.1.1",
+  "type": "module",
+  "description": "Typed Three.js-style scene graph and native software 3D renderer for Gea devices",
+  "exports": {
+    ".": "./src/index.ts",
+    "./three": "./src/three/index.ts",
+    "./renderer": "./src/renderer/GeaRenderer.ts",
+    "./raster": "./src/raster/pipeline.ts",
+    "./src/*": "./src/*",
+    "./native/*": "./src/native/*"
+  },
+  "scripts": {
+    "check": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@geastack/core": "^0.1.41"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3"
+  },
+  "license": "GPL-3.0-only",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/geastack/gea3d.git"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "src",
+    "LICENSE",
+    "README.md",
+    "THIRD_PARTY_NOTICES.md"
+  ]
+}

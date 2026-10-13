@@ -1,0 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-only
+export { RasterPipeline, SHADE_LAMBERT, SHADE_NORMAL, SHADE_UNLIT } from './raster/pipeline'
+export { CtxPresenter } from './raster/presenter'
+export type { TrianglePresenter } from './raster/presenter'
+export { GeaRenderer } from './renderer/GeaRenderer'
+export type { GeaRendererOptions } from './renderer/GeaRenderer'
