@@ -364,6 +364,84 @@ GEA3D_INLINE void shadeEach(Pixel *dst, int count, std::int32_t r, std::int32_t 
 #endif
 }
 
+#if GEA_PIXEL_PIE_FILL16 && !GEA_PIXEL_FORMAT_IS_8888 && !GEA_PIXEL_FORMAT_IS_GRAY
+#define GEA3D_PIE_SHADE 1
+// ESP32-S3 PIE Gouraud span: eight RGB565 pixels per iteration. Each channel
+// steps in 32-bit lanes (four pixels per q register), so every pixel is
+// exactly packRgb(r + dr*i, ...) of the scalar walk: for a channel in
+// 0..0xFFFFFF, (r >> 8) & 0xF800 == (r >> 19) << 11 and likewise for green
+// and blue, which needs shifts only, no mask registers. Two groups of four
+// are narrowed to 16-bit lanes with one unzip and stored with one 128-bit
+// store. q0-q2 hold the channels, q6 streams the 4-pixel steps from memory;
+// q registers are caller-saved and switched lazily by the IDF port.
+// dst must be 16-byte aligned; count8 >= 1 groups of eight.
+GEA3D_INLINE void shadePie(Pixel *dst, int count8, std::int32_t r, std::int32_t g, std::int32_t b, std::int32_t dr, std::int32_t dg, std::int32_t db)
+{
+	alignas(16) std::int32_t start[12] = {r, r + dr, r + 2 * dr, r + 3 * dr, g, g + dg, g + 2 * dg, g + 3 * dg, b, b + db, b + 2 * db, b + 3 * db};
+	alignas(16) std::int32_t step[12] = {4 * dr, 4 * dr, 4 * dr, 4 * dr, 4 * dg, 4 * dg, 4 * dg, 4 * dg, 4 * db, 4 * db, 4 * db, 4 * db};
+	const std::int32_t *acc = start;
+	const std::int32_t *st = step;
+	const int s19 = 19, s11 = 11, s18 = 18, s5 = 5;
+	asm volatile(
+		"ee.vld.128.ip q0, %[acc], 16\n"
+		"ee.vld.128.ip q1, %[acc], 16\n"
+		"ee.vld.128.ip q2, %[acc], 0\n"
+		"loopnez %[n], 1f\n"
+		// pixels 0..3 -> q3
+		"wsr.sar %[s19]\n"
+		"ee.vsr.32 q3, q0\n"
+		"ee.vsr.32 q7, q2\n"
+		"wsr.sar %[s11]\n"
+		"ee.vsl.32 q3, q3\n"
+		"ee.orq q3, q3, q7\n"
+		"wsr.sar %[s18]\n"
+		"ee.vsr.32 q7, q1\n"
+		"wsr.sar %[s5]\n"
+		"ee.vsl.32 q7, q7\n"
+		"ee.orq q3, q3, q7\n"
+		"ee.vld.128.ip q6, %[st], 16\n"
+		"ee.vadds.s32 q0, q0, q6\n"
+		"ee.vld.128.ip q6, %[st], 16\n"
+		"ee.vadds.s32 q1, q1, q6\n"
+		"ee.vld.128.ip q6, %[st], -32\n"
+		"ee.vadds.s32 q2, q2, q6\n"
+		// pixels 4..7 -> q4
+		"wsr.sar %[s19]\n"
+		"ee.vsr.32 q4, q0\n"
+		"ee.vsr.32 q7, q2\n"
+		"wsr.sar %[s11]\n"
+		"ee.vsl.32 q4, q4\n"
+		"ee.orq q4, q4, q7\n"
+		"wsr.sar %[s18]\n"
+		"ee.vsr.32 q7, q1\n"
+		"wsr.sar %[s5]\n"
+		"ee.vsl.32 q7, q7\n"
+		"ee.orq q4, q4, q7\n"
+		"ee.vld.128.ip q6, %[st], 16\n"
+		"ee.vadds.s32 q0, q0, q6\n"
+		"ee.vld.128.ip q6, %[st], 16\n"
+		"ee.vadds.s32 q1, q1, q6\n"
+		"ee.vld.128.ip q6, %[st], -32\n"
+		"ee.vadds.s32 q2, q2, q6\n"
+		// Low halves of both groups, in pixel order, into q3 (q4 = zeros).
+		"ee.vunzip.16 q3, q4\n"
+#if GEA_EMBEDDED_PIXEL_PANEL_ENDIAN
+		// Panel byte order: split low/high bytes, re-interleave swapped.
+		"ee.vunzip.8 q3, q4\n"
+		"ee.vzip.8 q4, q3\n"
+		"ee.vst.128.ip q4, %[dst], 16\n"
+#else
+		"ee.vst.128.ip q3, %[dst], 16\n"
+#endif
+		"1:\n"
+		: [dst] "+r"(dst), [acc] "+r"(acc), [st] "+r"(st)
+		: [n] "r"(count8), [s19] "r"(s19), [s11] "r"(s11), [s18] "r"(s18), [s5] "r"(s5)
+		: "memory");
+}
+#else
+#define GEA3D_PIE_SHADE 0
+#endif
+
 // A Gouraud span whose channels stay in 0..0xFFFFFF (16.16). Spans that
 // change colour rarely are filled as flat runs between the changes; the
 // pixels are exactly those of the per-pixel walk.
@@ -371,6 +449,20 @@ GEA3D_INLINE void shadePixels(Pixel *dst, int count, std::int32_t r, std::int32_
 {
 	const int last = count - 1;
 	const int changes = levelChanges(r, r + dr * last, kShiftR) + levelChanges(g, g + dg * last, kShiftG) + levelChanges(b, b + db * last, kShiftB);
+#if GEA3D_PIE_SHADE
+	// Long steady runs stay flat vector fills; anything busier is shaded
+	// eight pixels at a time with no per-run divides.
+	if (count >= 16 && count < 32 * (changes + 1)) {
+		const int head = static_cast<int>(((16u - (reinterpret_cast<std::uintptr_t>(dst) & 15u)) & 15u) >> 1);
+		shadeEach(dst, head, r, g, b, dr, dg, db);
+		const std::int32_t rh = r + dr * head, gh = g + dg * head, bh = b + db * head;
+		const int body = (count - head) >> 3;
+		shadePie(dst + head, body, rh, gh, bh, dr, dg, db);
+		const int done = head + (body << 3);
+		shadeEach(dst + done, count - done, r + dr * done, g + dg * done, b + db * done, dr, dg, db);
+		return;
+	}
+#endif
 	if (count < 4 * (changes + 1)) {
 		shadeEach(dst, count, r, g, b, dr, dg, db);
 		return;
