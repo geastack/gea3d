@@ -135,18 +135,55 @@ struct Scratch {
 	int dirtyLast = -1;
 };
 
+
 namespace detail {
 
 GEA3D_INLINE int minInt(int a, int b) { return a < b ? a : b; }
 GEA3D_INLINE int maxInt(int a, int b) { return a > b ? a : b; }
+#if defined(__XTENSA__) && !defined(__XTENSA_SOFT_FLOAT__)
+// Xtensa's FPU has no min/max: the builtins become fminf/fmaxf calls, a
+// function call per clamp. Compares keep fmax's NaN-to-`lo`.
+#define GEA3D_XTENSA_FPU 1
+GEA3D_INLINE float clampFloat(float v, float lo, float hi) { return !(v >= lo) ? lo : (v > hi ? hi : v); }
+#else
+#define GEA3D_XTENSA_FPU 0
 // Branch-free on FPv5 (VMINNM/VMAXNM): a float compare's transfer to the
 // integer flags stalls the Cortex-M7 pipeline.
 GEA3D_INLINE float clampFloat(float v, float lo, float hi) { return __builtin_fminf(__builtin_fmaxf(v, lo), hi); }
+#endif
 GEA3D_INLINE int clampInt(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
 GEA3D_INLINE int ctz(std::uint32_t value) { return __builtin_ctz(value); }
 
+#if GEA3D_XTENSA_FPU
+// Round to nearest, ties away from zero. roundf is a libm call on Xtensa; the
+// truncating conversion is one instruction, and value - trunc(value) is exact
+// for every float below 2^24 (larger ones are already integers).
+GEA3D_INLINE std::int32_t roundToInt(float value)
+{
+	std::int32_t whole = static_cast<std::int32_t>(value);
+	const float fraction = value - static_cast<float>(whole);
+	if (fraction >= 0.5f) whole++;
+	else if (fraction <= -0.5f) whole--;
+	return whole;
+}
+
+// 1 / value. GCC lowers a float division here to the soft-float __divsf3,
+// though the FPU has a reciprocal seed: two Newton steps take its estimate to
+// float precision. On the ESP32-S3 the vertex transform halved (7.1 -> 3.2 ms
+// a frame for ~1,400 vertices) with this, clampFloat and roundToInt.
+GEA3D_INLINE float reciprocal(float value)
+{
+	float r;
+	asm("recip0.s %0, %1" : "=f"(r) : "f"(value));
+	r = r * (2.0f - value * r);
+	r = r * (2.0f - value * r);
+	return r;
+}
+#else
 // Round to nearest, ties away from zero (VRINTA on FPv5, no libm call).
 GEA3D_INLINE std::int32_t roundToInt(float value) { return static_cast<std::int32_t>(__builtin_roundf(value)); }
+GEA3D_INLINE float reciprocal(float value) { return 1.0f / value; }
+#endif
 
 constexpr float kFixedOne = 65536.0f;
 constexpr float kMaxSlope = 16000.0f;  // px per row; steeper edges span under one row
@@ -159,7 +196,7 @@ struct Edge {
 
 	GEA3D_INLINE void init(std::int32_t x0, std::int32_t y0, std::int32_t x1, std::int32_t y1, int row)
 	{
-		const float slope = clampFloat(static_cast<float>(x1 - x0) / static_cast<float>(y1 - y0), -kMaxSlope, kMaxSlope);
+		const float slope = clampFloat(static_cast<float>(x1 - x0) * reciprocal(static_cast<float>(y1 - y0)), -kMaxSlope, kMaxSlope);
 		const int top = (y0 - 8 + 15) >> 4;
 		const float xTop = (static_cast<float>(x0) + static_cast<float>(top * 16 + 8 - y0) * slope) * (1.0f / 16.0f);
 		step = roundToInt(slope * kFixedOne);
@@ -662,7 +699,7 @@ private:
 			return span;
 		}
 
-		const float invArea = 1.0f / area;
+		const float invArea = detail::reciprocal(area);
 		if (span.smooth) {
 			span.r.init(sx, sy, invArea, prim.r[i0], prim.r[i1], prim.r[i2]);
 			span.g.init(sx, sy, invArea, prim.g[i0], prim.g[i1], prim.g[i2]);
@@ -1016,7 +1053,7 @@ private:
 			w.from = 1;
 		}
 		const float span = mb - ma;
-		w.inv = span > 0.0f ? 1.0f / span : 0.0f;
+		w.inv = span > 0.0f ? detail::reciprocal(span) : 0.0f;
 		const float slope = (nb - na) * w.inv;
 		const int across = detail::maxInt(prim.width, 1);
 		w.lo = -((across - 1) >> 1);
@@ -1028,7 +1065,7 @@ private:
 		w.last = detail::minInt(detail::roundToInt(mb), w.xMajor ? x1_ : y1_);
 		// Where the minor coordinate can round into the region, with slack.
 		if (slope != 0.0f) {
-			const float perMinor = 1.0f / slope;
+			const float perMinor = detail::reciprocal(slope);
 			float m0 = ma + (static_cast<float>(w.minorLo - 1 - w.hi) - na) * perMinor;
 			float m1 = ma + (static_cast<float>(w.minorHi + 1 - w.lo) - na) * perMinor;
 			if (slope < 0.0f) swapFloat(m0, m1);

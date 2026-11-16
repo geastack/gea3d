@@ -37,6 +37,9 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "esp_memory_utils.h"
+#include "esp_heap_caps.h"
+#include "freertos/idf_additions.h"
 #define GEA3D_ASYNC_PRESENT 1
 #else
 #define GEA3D_ASYNC_PRESENT 0
@@ -406,6 +409,15 @@ struct Renderer {
 };
 
 Renderer g_renderer;
+// Bumped each time a frame slot is rebuilt; keys the per-frame strip lists.
+std::uint32_t g_frameSerial[2] = {0, 0};
+// Per frame slot, a content hash of each kBandHashRows-row band: what its
+// primitives draw there, in draw order. A composited frame marks dirty only
+// the bands that differ from the frame on screen.
+constexpr int kBandHashRows = 8;
+std::vector<std::uint64_t> g_bandHash[2];
+std::vector<std::uint64_t> g_shownBandHash;
+bool g_shownBandHashValid = false;
 
 // Fast memory for the raster. On the STM32F7 the heap and framebuffers are
 // SDRAM (framebuffers write-through), so two band buffers fill the zero-wait
@@ -482,8 +494,13 @@ RayHit g_rayHit;
 
 // ---------------------------------------------------------------- helpers
 
+#if GEA3D_XTENSA_FPU
+// No float max on Xtensa: the builtin is an fmaxf call.
+GEA3D_INLINE float maxFloat(float a, float b) { return a > b || b != b ? a : b; }
+#else
 // VMAXNM on FPv5: no float compare stalls the pipeline.
 GEA3D_INLINE float maxFloat(float a, float b) { return __builtin_fmaxf(a, b); }
+#endif
 
 // 0..255 by truncation; clamped in integer registers (USAT), not with float
 // compares.
@@ -610,7 +627,7 @@ GEA3D_INLINE float fogFactor(float distance)
 	const Environment &env = g_renderer.environment;
 	if (env.fog == 1) {
 		if (env.fogFar <= env.fogNear) return 1.0f;
-		return clampFloat((env.fogFar - distance) / (env.fogFar - env.fogNear), 0.0f, 1.0f);
+		return clampFloat((env.fogFar - distance) * raster::detail::reciprocal(env.fogFar - env.fogNear), 0.0f, 1.0f);
 	}
 	if (env.fog == 2) {
 		const float d = env.fogDensity * distance;
@@ -644,14 +661,14 @@ GEA3D_INLINE void project(const View &v, float x, float y, float z, std::int32_t
 	const float cy = p[1] * x + p[5] * y + p[9] * z + p[13];
 	float cw = p[3] * x + p[7] * y + p[11] * z + p[15];
 	if (cw < 0.000001f && cw > -0.000001f) cw = 0.000001f;
-	const float invW = 1.0f / cw;
+	const float invW = raster::detail::reciprocal(cw);
 	const float fx = clampFloat((cx * invW + 1.0f) * v.halfW, -kCoordLimit, kCoordLimit);
 	const float fy = clampFloat((1.0f - cy * invW) * v.halfH, -kCoordLimit, kCoordLimit);
 	*sx = roundToInt(fx * 16.0f);
 	*sy = roundToInt(fy * 16.0f);
 	if (v.orthographic) {
 		const float range = v.far - v.near;
-		*depth = range > 0.0f ? clampFloat(1.0f - (-z - v.near) / range, 0.0f, 1.0f) : 1.0f;
+		*depth = range > 0.0f ? clampFloat(1.0f - (-z - v.near) * raster::detail::reciprocal(range), 0.0f, 1.0f) : 1.0f;
 	} else {
 		*depth = clampFloat(v.near * invW, 0.0f, 1.0f);
 	}
@@ -1589,6 +1606,65 @@ void rasterizeInto(const raster::Frame &frame, Pixel *base, int stride, int x0, 
 #endif
 }
 
+#if GEA3D_ASYNC_PRESENT
+// A target in internal RAM (the display's staged strip) takes painter's order
+// straight into it: the background, then the region's primitives back to
+// front. Coverage mode suits slow target memory only; in fast memory its
+// per-pixel coverage bits, and the depth scratch it zeroes for every region
+// once anything blends, cost more than the overdraw they save (Neon Drift on
+// the CrowPanel 7.0: 66 -> 19.5 ms of raster a frame).
+// The UI paints the underlay in strips of one height, top to bottom, every
+// frame: each strip's primitives come from bands of that height built once
+// per frame, not from a scan of every primitive per strip.
+struct StripLists {
+	const raster::Frame *frame = nullptr;
+	std::uint32_t serial = 0;
+	int rows = 0;
+	Bands bands;
+};
+StripLists g_stripLists;
+
+bool rasterizePainterInPlace(const raster::Frame &frame, Pixel *base, int stride, int x0, int y0, int x1, int y1)
+{
+	if (!esp_ptr_internal(base + static_cast<std::ptrdiff_t>(y0) * stride + x0)) return false;
+	x1 = std::min(x1, frame.width - 1);
+	y1 = std::min(y1, frame.height - 1);
+	if (x0 > x1 || y0 > y1) return true;
+
+	const int rows = y1 - y0 + 1;
+	const std::ptrdiff_t slot = &frame - g_renderer.frames;
+	raster::BandList list{nullptr, 0, 0};
+	if (slot >= 0 && slot < 2 && y0 % rows == 0) {
+		StripLists &cache = g_stripLists;
+		const std::uint32_t serial = g_frameSerial[slot];
+		if (cache.frame != &frame || cache.serial != serial || cache.rows != rows) {
+			cache.bands.rows = rows;
+			buildBandLists(frame, 0, frame.height - 1, cache.bands);
+			cache.frame = &frame;
+			cache.serial = serial;
+			cache.rows = rows;
+		}
+		// A short last strip reads its band's list: the extra primitives clip away.
+		list = bandList(cache.bands, y0 / rows);
+	} else {
+		std::vector<std::int32_t> &items = g_renderer.bands.items;
+		items.clear();
+		int opaque = 0;
+		for (int i = 0; i < frame.count; i++) {
+			const int first = static_cast<std::int16_t>(frame.rows[i] & 0xFFFFu);
+			const int last = static_cast<std::int16_t>(frame.rows[i] >> 16);
+			if (last < y0 || first > y1) continue;
+			items.push_back(frame.order[static_cast<std::size_t>(i)]);
+			opaque += i < frame.opaqueCount;
+		}
+		list = raster::BandList{items.data(), static_cast<int>(items.size()), opaque};
+	}
+	raster::Rasterizer rasterizer(frame, g_renderer.scratch, base, stride, x0, y0, x1, y1, raster::Occlusion::kPainter);
+	rasterizer.runPainter(list);
+	return true;
+}
+#endif
+
 // Display::flushRectsRasterized chunk: pixels hold rows [oy, oy + h) of a
 // full-width band, so the chunk width is its stride.
 void rasterChunk(Pixel *pixels, int width, int height, int ox, int oy, void *user)
@@ -1672,18 +1748,76 @@ void paintUnderlay(int x0, int y0, int x1, int y1, void *user)
 	if (x0 > x1 || y0 > y1) return;
 
 	const int stride = canvas->strideBytes() / static_cast<int>(sizeof(Pixel));
+#if GEA3D_ASYNC_PRESENT
+	if (rasterizePainterInPlace(*static_cast<const raster::Frame *>(user), canvas->pixels(), stride, x0, y0, x1, y1)) return;
+#endif
 	rasterizeInto(*static_cast<const raster::Frame *>(user), canvas->pixels(), stride, x0, y0, x1, y1);
 }
 
-bool presentUnderlay(raster::Frame &frame)
-{
-	if (!gea::framework::display::Underlay::composited()) return false;
+// The display's draw canvas for state only (the dirty box), where the target
+// splits it from pixel access. A double-buffered panel readies its back buffer
+// the first time Display::canvas() is asked for, copying every stale pixel in
+// from the front; asked here, before the UI's refresh can say it repaints the
+// whole frame, that was a full-screen PSRAM copy every frame.
+extern "C" gea::framework::graphics::Canvas *gea_display_state_canvas() __attribute__((weak));
 
-	auto *canvas = pd::Display::canvas();
-	if (!canvas || frame.width <= 0 || frame.height <= 0) return false;
+// `hash` is the frame's band hashes, or null when it has none: then every
+// row is dirty. Rows whose bands match the frame on screen stay as they are,
+// so the UI repaints, recomposites and copies out only what moved.
+bool presentUnderlay(raster::Frame &frame, const std::vector<std::uint64_t> *hash = nullptr)
+{
+	if (!gea::framework::display::Underlay::composited()) {
+		g_shownBandHashValid = false;
+		return false;
+	}
+
+	auto *canvas = gea_display_state_canvas ? gea_display_state_canvas() : nullptr;
+	if (!canvas) canvas = pd::Display::canvas();
+	if (!canvas || frame.width <= 0 || frame.height <= 0) {
+		g_shownBandHashValid = false;
+		return false;
+	}
+
+	// Changed bands as row runs; unchanged bands between them stay clean, so
+	// a frame whose motion sits in a few separate bands repaints only those.
+	constexpr int kMaxRuns = 8;
+	int runFirst[kMaxRuns];
+	int runLast[kMaxRuns];
+	int runs = 0;
+	if (hash && g_shownBandHashValid && g_shownBandHash.size() == hash->size() && gea::framework::display::Underlay::active()) {
+		const int bands = static_cast<int>(hash->size());
+		for (int b = 0; b < bands; b++) {
+			if ((*hash)[b] == g_shownBandHash[b]) continue;
+			if (runs > 0 && runLast[runs - 1] == b - 1) {
+				runLast[runs - 1] = b;
+			} else if (runs < kMaxRuns) {
+				runFirst[runs] = runLast[runs] = b;
+				runs++;
+			} else {
+				runLast[runs - 1] = b;  // out of runs: extend the last one
+			}
+		}
+		for (int k = 0; k < runs; k++) {
+			runFirst[k] *= kBandHashRows;
+			runLast[k] = std::min(frame.height - 1, (runLast[k] + 1) * kBandHashRows - 1);
+		}
+	} else {
+		runFirst[0] = 0;
+		runLast[0] = frame.height - 1;
+		runs = 1;
+	}
+	if (hash) {
+		g_shownBandHash = *hash;
+		g_shownBandHashValid = true;
+	} else {
+		g_shownBandHashValid = false;
+	}
 
 	gea::framework::display::Underlay::set(paintUnderlay, &frame, 0, 0, frame.width - 1, frame.height - 1);
-	canvas->markDirty(0, 0, frame.width - 1, frame.height - 1);
+	// A background colour fills the frame before any triangle: every pixel of
+	// it is written, so the UI's refresh need not restore what was there.
+	gea::framework::display::Underlay::setOpaque(frame.background.mode != raster::kBackgroundNone);
+	for (int k = 0; k < runs; k++) canvas->markDirty(0, runFirst[k], frame.width - 1, runLast[k]);
 	return true;
 }
 #endif
@@ -1739,7 +1873,8 @@ void waitForPresent() {}
 #endif
 
 // Hands the built frame to its destination. Returns false when rejected.
-bool present()
+// `hash`: the frame's band hashes, when it has them (drawScene builds).
+bool present(const std::vector<std::uint64_t> *hash = nullptr)
 {
 	Renderer &r = g_renderer;
 	raster::Frame &frame = r.frame();
@@ -1754,7 +1889,7 @@ bool present()
 #else
 #if GEA3D_UNDERLAY
 	waitForPresent();
-	if (presentUnderlay(frame)) {
+	if (presentUnderlay(frame, hash)) {
 		r.stats.composited = 1;
 		return true;
 	}
@@ -1787,23 +1922,107 @@ void setBackground(raster::Background &background, double bgColor)
 	std::memcpy(background.bottom, background.top, sizeof(background.top));
 }
 
+
+#if GEA3D_ASYNC_PRESENT && GEA3D_UNDERLAY && !GEA3D_PRESENT_COMMANDS
+// Frame build on the other core. drawScene presents the frame built during
+// the previous call and hands this call's build to a task pinned beside the
+// display's row worker, below it in priority: the build (world matrices,
+// transform, clip, sort) overlaps the UI's strip loop instead of preceding it,
+// for one frame of latency. The build reads nodes, buffers, geometries and
+// materials and writes world matrices, so every other entry point waits for
+// it first; the painter reads only the shown frame, the band lists and the
+// raster scratch, none of which the build touches.
+#define GEA3D_ASYNC_BUILD 1
+extern "C" void gea_render_worker_block_when_idle(bool on) __attribute__((weak));
+
+struct BuildJob {
+	int scene = -1;
+	int camera = -1;
+	int width = 0;
+	int height = 0;
+};
+
+TaskHandle_t g_buildTask = nullptr;
+SemaphoreHandle_t g_buildWork = nullptr;
+SemaphoreHandle_t g_buildDone = nullptr;
+BuildJob g_buildJob;
+bool g_buildInFlight = false;
+// The presented frame's stats while the next build overwrites the live ones.
+Stats g_shownStats;
+bool g_buildFailed = false;
+// The slot holding a finished frame not yet presented, or -1.
+int g_readyFrame = -1;
+
+void buildFrame(int scene, int camera, int width, int height);
+
+void buildTaskMain(void *)
+{
+	for (;;) {
+		xSemaphoreTake(g_buildWork, portMAX_DELAY);
+		buildFrame(g_buildJob.scene, g_buildJob.camera, g_buildJob.width, g_buildJob.height);
+		g_renderer.stats.composited = 1;
+		xSemaphoreGive(g_buildDone);
+	}
+}
+
+bool ensureBuildTask()
+{
+	if (g_buildTask) return true;
+	if (g_buildFailed) return false;
+	g_buildFailed = true;
+	g_buildWork = xSemaphoreCreateBinary();
+	g_buildDone = xSemaphoreCreateBinary();
+	if (!g_buildWork || !g_buildDone) return false;
+	const BaseType_t core = xPortGetCoreID() == 0 ? 1 : 0;
+	const UBaseType_t own = uxTaskPriorityGet(nullptr);
+	const UBaseType_t priority = own > 1 ? own - 1 : 1;
+	BaseType_t ok = xTaskCreatePinnedToCore(buildTaskMain, "gea3d_build", 8192, nullptr, priority, &g_buildTask, core);
+	if (ok != pdPASS || !g_buildTask) {
+		g_buildTask = nullptr;
+		ok = xTaskCreatePinnedToCoreWithCaps(buildTaskMain, "gea3d_build", 8192, nullptr, priority, &g_buildTask, core, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+	}
+	if (ok != pdPASS || !g_buildTask) {
+		g_buildTask = nullptr;
+		return false;
+	}
+	if (gea_render_worker_block_when_idle) gea_render_worker_block_when_idle(true);
+	g_buildFailed = false;
+	return true;
+}
+
+void waitBuild()
+{
+	if (!g_buildInFlight) return;
+	xSemaphoreTake(g_buildDone, portMAX_DELAY);
+	g_buildInFlight = false;
+}
+
+#define GEA3D_SYNC_BUILD() waitBuild()
+#else
+#define GEA3D_ASYNC_BUILD 0
+#define GEA3D_SYNC_BUILD() ((void)0)
+#endif
+
 }  // namespace
 
 // ================================================================ buffers
 
 double createBuffer()
 {
+	GEA3D_SYNC_BUILD();
 	return allocate(g_buffers);
 }
 
 void deleteBuffer(double buffer)
 {
+	GEA3D_SYNC_BUILD();
 	Buffer *slot = lookup(g_buffers, buffer);
 	if (slot) *slot = Buffer();
 }
 
 void bufferDataF32Raw(double buffer, const float *data, std::size_t count)
 {
+	GEA3D_SYNC_BUILD();
 	Buffer *slot = lookup(g_buffers, buffer);
 	if (!slot) return;
 	slot->f32.assign(data, data + count);
@@ -1812,6 +2031,7 @@ void bufferDataF32Raw(double buffer, const float *data, std::size_t count)
 
 void bufferDataU32Raw(double buffer, const std::uint32_t *data, std::size_t count)
 {
+	GEA3D_SYNC_BUILD();
 	Buffer *slot = lookup(g_buffers, buffer);
 	if (!slot) return;
 	slot->u32.assign(data, data + count);
@@ -1822,17 +2042,20 @@ void bufferDataU32Raw(double buffer, const std::uint32_t *data, std::size_t coun
 
 double createGeometry()
 {
+	GEA3D_SYNC_BUILD();
 	return allocate(g_geometries);
 }
 
 void deleteGeometry(double geometry)
 {
+	GEA3D_SYNC_BUILD();
 	Geometry *slot = lookup(g_geometries, geometry);
 	if (slot) *slot = Geometry();
 }
 
 void geometryBuffers(double geometry, double position, double index, double color, double normal)
 {
+	GEA3D_SYNC_BUILD();
 	Geometry *slot = lookup(g_geometries, geometry);
 	if (!slot) return;
 	slot->position = static_cast<int>(position);
@@ -1844,17 +2067,20 @@ void geometryBuffers(double geometry, double position, double index, double colo
 
 double createMaterial()
 {
+	GEA3D_SYNC_BUILD();
 	return allocate(g_materials);
 }
 
 void deleteMaterial(double material)
 {
+	GEA3D_SYNC_BUILD();
 	Material *slot = lookup(g_materials, material);
 	if (slot) *slot = Material();
 }
 
 void materialSet(double material, double shade, double r, double g, double b, double opacity, double side, double flags, double size)
 {
+	GEA3D_SYNC_BUILD();
 	Material *slot = lookup(g_materials, material);
 	if (!slot) return;
 	slot->shade = static_cast<int>(shade);
@@ -1870,6 +2096,7 @@ void materialSet(double material, double shade, double r, double g, double b, do
 
 double createNode(double kind)
 {
+	GEA3D_SYNC_BUILD();
 	const int id = allocate(g_nodes);
 	g_nodes[static_cast<std::size_t>(id)].kind = static_cast<int>(kind);
 	return id;
@@ -1877,6 +2104,7 @@ double createNode(double kind)
 
 void deleteNode(double node)
 {
+	GEA3D_SYNC_BUILD();
 	Node *slot = lookup(g_nodes, node);
 	if (!slot) return;
 
@@ -1888,6 +2116,7 @@ void deleteNode(double node)
 
 void nodeParent(double node, double parent)
 {
+	GEA3D_SYNC_BUILD();
 	if (!lookup(g_nodes, node)) return;
 
 	const int id = static_cast<int>(node);
@@ -1901,6 +2130,7 @@ void nodeParent(double node, double parent)
 
 void nodeTransform(double node, double px, double py, double pz, double qx, double qy, double qz, double qw, double sx, double sy, double sz)
 {
+	GEA3D_SYNC_BUILD();
 	Node *slot = lookup(g_nodes, node);
 	if (!slot) return;
 	const float position[3] = {static_cast<float>(px), static_cast<float>(py), static_cast<float>(pz)};
@@ -1920,6 +2150,7 @@ void nodeTransform(double node, double px, double py, double pz, double qx, doub
 
 void nodeMatrixRaw(double node, const float *elements, std::size_t count)
 {
+	GEA3D_SYNC_BUILD();
 	Node *slot = lookup(g_nodes, node);
 	if (!slot || count < 16) return;
 	// An unchanged matrix keeps the cached world matrices.
@@ -1932,6 +2163,7 @@ void nodeMatrixRaw(double node, const float *elements, std::size_t count)
 
 void nodeFlags(double node, double visible, double frustumCulled, double renderOrder)
 {
+	GEA3D_SYNC_BUILD();
 	Node *slot = lookup(g_nodes, node);
 	if (!slot) return;
 	slot->visible = visible != 0;
@@ -1941,6 +2173,7 @@ void nodeFlags(double node, double visible, double frustumCulled, double renderO
 
 void nodeGeometry(double node, double geometry, double material)
 {
+	GEA3D_SYNC_BUILD();
 	Node *slot = lookup(g_nodes, node);
 	if (!slot) return;
 	slot->geometry = static_cast<int>(geometry);
@@ -1949,6 +2182,7 @@ void nodeGeometry(double node, double geometry, double material)
 
 void nodeInstances(double node, double matrices, double colors, double count)
 {
+	GEA3D_SYNC_BUILD();
 	Node *slot = lookup(g_nodes, node);
 	if (!slot) return;
 	slot->instanced = true;
@@ -1959,6 +2193,7 @@ void nodeInstances(double node, double matrices, double colors, double count)
 
 void nodeLight(double node, double kind, double r, double g, double b, double intensity, double groundR, double groundG, double groundB, double distance, double decay)
 {
+	GEA3D_SYNC_BUILD();
 	Node *slot = lookup(g_nodes, node);
 	if (!slot) return;
 	slot->lightKind = static_cast<int>(kind);
@@ -1975,6 +2210,7 @@ void nodeLight(double node, double kind, double r, double g, double b, double in
 
 void nodeLightTarget(double node, double x, double y, double z)
 {
+	GEA3D_SYNC_BUILD();
 	Node *slot = lookup(g_nodes, node);
 	if (!slot) return;
 	slot->target[0] = static_cast<float>(x);
@@ -1984,6 +2220,7 @@ void nodeLightTarget(double node, double x, double y, double z)
 
 void cameraProjectionRaw(double node, const float *elements, std::size_t count, double near, double far)
 {
+	GEA3D_SYNC_BUILD();
 	Node *slot = lookup(g_nodes, node);
 	if (!slot || count < 16) return;
 	std::memcpy(slot->projection, elements, sizeof(slot->projection));
@@ -1993,6 +2230,7 @@ void cameraProjectionRaw(double node, const float *elements, std::size_t count, 
 
 void sceneEnvironment(double scene, double background, double top, double bottom, double fog, double fogColor, double fogNear, double fogFar, double fogDensity)
 {
+	GEA3D_SYNC_BUILD();
 	Node *slot = lookup(g_nodes, scene);
 	if (!slot) return;
 
@@ -2015,17 +2253,20 @@ void sceneEnvironment(double scene, double background, double top, double bottom
 
 void renderOptions(double depthBuffer, double capacity)
 {
+	GEA3D_SYNC_BUILD();
 	g_renderer.depthBuffer = depthBuffer != 0;
 	if (capacity >= 64) g_renderer.capacity = static_cast<int>(capacity);
 }
 
 void renderTarget(double surface)
 {
+	GEA3D_SYNC_BUILD();
 	g_renderer.surface = static_cast<int>(surface);
 }
 
 double createSurface(double width, double height)
 {
+	GEA3D_SYNC_BUILD();
 	const int w = static_cast<int>(width);
 	const int h = static_cast<int>(height);
 	if (w <= 0 || h <= 0 || g_surfaces.count >= 8) return -1;
@@ -2045,36 +2286,138 @@ double createSurface(double width, double height)
 	return id;
 }
 
-double drawScene(double scene, double camera, double width, double height)
+namespace {
+GEA3D_INLINE std::uint64_t mixHash(std::uint64_t h, std::uint64_t v)
 {
-	Node *sceneNode = lookup(g_nodes, scene);
-	Node *cameraNode = lookup(g_nodes, camera);
-	if (!sceneNode || !cameraNode) return 0;
+	h ^= v + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2);
+	return h * 0xBF58476D1CE4E5B9ull;
+}
 
+std::uint64_t primHash(const raster::Prim &p, bool opaque, bool withDepth, bool withKey)
+{
+	std::uint64_t h = 0xCBF29CE484222325ull;
+	for (int k = 0; k < 3; k++) h = mixHash(h, (static_cast<std::uint64_t>(static_cast<std::uint32_t>(p.x[k])) << 32) | static_cast<std::uint32_t>(p.y[k]));
+	h = mixHash(h, static_cast<std::uint64_t>(p.r[0]) | static_cast<std::uint64_t>(p.r[1]) << 8 | static_cast<std::uint64_t>(p.r[2]) << 16 |
+	                   static_cast<std::uint64_t>(p.g[0]) << 24 | static_cast<std::uint64_t>(p.g[1]) << 32 | static_cast<std::uint64_t>(p.g[2]) << 40 |
+	                   static_cast<std::uint64_t>(p.b[0]) << 48 | static_cast<std::uint64_t>(p.b[1]) << 56);
+	h = mixHash(h, static_cast<std::uint64_t>(p.b[2]) | static_cast<std::uint64_t>(p.type) << 8 | static_cast<std::uint64_t>(p.flags) << 16 |
+	                   static_cast<std::uint64_t>(p.alpha) << 24 | static_cast<std::uint64_t>(p.width) << 32 | static_cast<std::uint64_t>(p.color) << 40 |
+	                   static_cast<std::uint64_t>(opaque) << 56);
+	if (withDepth) {
+		std::uint32_t d[3];
+		std::memcpy(d, p.depth, sizeof(d));
+		h = mixHash(h, (static_cast<std::uint64_t>(d[0]) << 32) | d[1]);
+		h = mixHash(h, d[2]);
+	}
+	if (withKey) {
+		std::uint32_t key;
+		std::memcpy(&key, &p.key, sizeof(key));
+		h = mixHash(h, key);
+	}
+	return h;
+}
+
+// Band hashes of a sorted frame. Depth matters only to a depth-tested frame,
+// and the sort key only where blended primitives interleave by it.
+void hashBands(const raster::Frame &frame, std::vector<std::uint64_t> &out)
+{
+	const int bands = frame.height > 0 ? (frame.height + kBandHashRows - 1) / kBandHashRows : 0;
+	std::uint64_t seed = mixHash(0x84222325CBF29CE4ull, static_cast<std::uint64_t>(frame.width) << 32 | static_cast<std::uint32_t>(frame.height));
+	const raster::Background &bg = frame.background;
+	seed = mixHash(seed, static_cast<std::uint64_t>(bg.mode) | static_cast<std::uint64_t>(bg.top[0]) << 8 | static_cast<std::uint64_t>(bg.top[1]) << 16 |
+	                         static_cast<std::uint64_t>(bg.top[2]) << 24 | static_cast<std::uint64_t>(bg.bottom[0]) << 32 |
+	                         static_cast<std::uint64_t>(bg.bottom[1]) << 40 | static_cast<std::uint64_t>(bg.bottom[2]) << 48 |
+	                         static_cast<std::uint64_t>(frame.depthBuffer) << 56);
+	out.assign(static_cast<std::size_t>(bands), seed);
+	const bool withDepth = frame.depthBuffer;
+	const bool withKey = frame.blendCount > 0;
+	for (int i = 0; i < frame.count; i++) {
+		const int first = maxInt(static_cast<std::int16_t>(frame.rows[i] & 0xFFFFu), 0);
+		const int last = minInt(static_cast<std::int16_t>(frame.rows[i] >> 16), frame.height - 1);
+		if (first > last) continue;
+		const std::uint64_t h = primHash(frame.prims[frame.order[static_cast<std::size_t>(i)]], i < frame.opaqueCount, withDepth, withKey);
+		for (int b = first / kBandHashRows; b <= last / kBandHashRows; b++) out[static_cast<std::size_t>(b)] = mixHash(out[static_cast<std::size_t>(b)], h);
+	}
+}
+
+// Builds the scene into frames[building] (no present).
+void buildFrame(int scene, int camera, int width, int height)
+{
+	Node &sceneNode = g_nodes[static_cast<std::size_t>(scene)];
+	Node &cameraNode = g_nodes[static_cast<std::size_t>(camera)];
 	Renderer &r = g_renderer;
-	beginFrameState(static_cast<int>(width), static_cast<int>(height));
+	beginFrameState(width, height);
 	r.legacyActive = false;
 	raster::Frame &frame = r.frame();
-	r.environment = sceneNode->environment;
+	r.environment = sceneNode.environment;
 	frame.background = r.environment.background;
 
-	collect(static_cast<int>(scene));
+	collect(scene);
 
-	ensureWorld(static_cast<int>(camera));
-	math::invertAffine(r.view.view, cameraNode->world);
-	setProjection(cameraNode->projection, cameraNode->near, cameraNode->far);
+	ensureWorld(camera);
+	math::invertAffine(r.view.view, cameraNode.world);
+	setProjection(cameraNode.projection, cameraNode.near, cameraNode.far);
 
 	for (const int id : r.lightNodes) addLight(g_nodes[static_cast<std::size_t>(id)]);
 	for (const int id : r.drawables) drawNode(g_nodes[static_cast<std::size_t>(id)]);
 
 	sortFrame();
-	const int count = frame.count;
-	return present() ? count : -1;
+	r.stats.primitives = frame.count;
+	hashBands(frame, g_bandHash[r.building]);
+	g_frameSerial[r.building]++;
+}
+}  // namespace
+
+double drawScene(double scene, double camera, double width, double height)
+{
+	GEA3D_SYNC_BUILD();
+	if (!lookup(g_nodes, scene) || !lookup(g_nodes, camera)) return 0;
+	const int sceneId = static_cast<int>(scene);
+	const int cameraId = static_cast<int>(camera);
+	const int w = static_cast<int>(width);
+	const int h = static_cast<int>(height);
+	Renderer &r = g_renderer;
+
+#if GEA3D_ASYNC_BUILD
+	if (r.surface < 0 && gea::framework::display::Underlay::composited() && ensureBuildTask()) {
+		if (g_readyFrame < 0) {
+			// First frame (or after a synchronous one): nothing built ahead.
+			waitForPresent();
+			buildFrame(sceneId, cameraId, w, h);
+			g_readyFrame = r.building;
+		}
+		raster::Frame &shown = r.frames[g_readyFrame];
+		if (shown.width != w || shown.height != h || !presentUnderlay(shown, &g_bandHash[g_readyFrame])) {
+			g_readyFrame = -1;
+		} else {
+			const int count = shown.count;
+			g_shownStats = r.stats;
+			g_shownStats.composited = 1;
+			r.building = g_readyFrame ^ 1;
+			g_buildJob = BuildJob{sceneId, cameraId, w, h};
+			g_buildInFlight = true;
+			g_readyFrame = r.building;
+			xSemaphoreGive(g_buildWork);
+			return count;
+		}
+	} else {
+		g_readyFrame = -1;
+	}
+#endif
+
+	buildFrame(sceneId, cameraId, w, h);
+	const int count = r.frame().count;
+	return present(&g_bandHash[r.building]) ? count : -1;
 }
 
 double stat(double which)
 {
+	// The shown frame's counts: no wait for the build running ahead.
+#if GEA3D_ASYNC_BUILD
+	const Stats &s = g_buildInFlight ? g_shownStats : g_renderer.stats;
+#else
 	const Stats &s = g_renderer.stats;
+#endif
 	switch (static_cast<int>(which)) {
 	case 0: return s.submitted;
 	case 1: return s.nearRejected;
@@ -2093,6 +2436,7 @@ double stat(double which)
 
 double raycast(double node, double ox, double oy, double oz, double dx, double dy, double dz, double near, double far)
 {
+	GEA3D_SYNC_BUILD();
 	Node *slot = lookup(g_nodes, node);
 	if (!slot || slot->kind != kNodeMesh) return 0;
 	Geometry *geometry = lookup(g_geometries, slot->geometry);
@@ -2163,6 +2507,7 @@ double raycast(double node, double ox, double oy, double oz, double dx, double d
 
 double rayResult(double which)
 {
+	GEA3D_SYNC_BUILD();
 	switch (static_cast<int>(which)) {
 	case 0: return g_rayHit.distance;
 	case 1: return g_rayHit.point[0];
@@ -2178,6 +2523,7 @@ double rayResult(double which)
 
 void beginFrameRaw(const float *projection, std::size_t count, double near, double bgColor, double viewportW, double viewportH)
 {
+	GEA3D_SYNC_BUILD();
 	Renderer &r = g_renderer;
 	beginFrameState(static_cast<int>(viewportW), static_cast<int>(viewportH));
 	r.legacyActive = true;
@@ -2191,6 +2537,7 @@ void beginFrameRaw(const float *projection, std::size_t count, double near, doub
 
 void ambientLight(double r, double g, double b)
 {
+	GEA3D_SYNC_BUILD();
 	Lights &lights = g_renderer.lights;
 	lights.ambient[0] += static_cast<float>(r);
 	lights.ambient[1] += static_cast<float>(g);
@@ -2199,6 +2546,7 @@ void ambientLight(double r, double g, double b)
 
 void directionalLight(double x, double y, double z, double r, double g, double b)
 {
+	GEA3D_SYNC_BUILD();
 	Lights &lights = g_renderer.lights;
 	float direction[3] = {static_cast<float>(x), static_cast<float>(y), static_cast<float>(z)};
 	if (lights.directionalCount >= kMaxLights || !math::normalize3(direction)) return;
@@ -2221,6 +2569,7 @@ void drawElementsRaw(double positionBuffer,
                      double baseB,
                      double doubleSide)
 {
+	GEA3D_SYNC_BUILD();
 	if (!g_renderer.legacyActive || modelViewCount < 16) return;
 	const Buffer *positions = bufferAt(static_cast<int>(positionBuffer));
 	if (!positions) return;
@@ -2251,6 +2600,7 @@ void drawElementsRaw(double positionBuffer,
 
 double endFrame()
 {
+	GEA3D_SYNC_BUILD();
 	if (!g_renderer.legacyActive) return 0;
 	g_renderer.legacyActive = false;
 	sortFrame();
