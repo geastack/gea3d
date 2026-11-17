@@ -1414,6 +1414,7 @@ void sortFrame()
 	Renderer &r = g_renderer;
 	raster::Frame &frame = r.frame();
 	const int n = frame.count;
+	for (int i = 0; i < n; i++) raster::prepareTriangle(frame.prims[i]);
 	frame.order.resize(static_cast<std::size_t>(n));
 	r.keys.resize(static_cast<std::size_t>(n));
 	r.bucketStarts.assign(2 * (kDepthBuckets + 1), 0);

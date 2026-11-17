@@ -29,6 +29,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <utility>
 #include <vector>
 
 #if defined(__GNUC__) || defined(__clang__)
@@ -51,6 +52,7 @@ enum PrimFlag : std::uint8_t {
 	kSmooth = 1,  // per-vertex colours interpolated across the primitive
 	kBlend = 2,   // alpha-blended (drawn back-to-front after the opaque pass)
 	kAdd = 4,     // with kBlend: added to the pixel (scaled by alpha), not mixed
+	kPrepared = 8,  // triangle: corners sorted by y, edges set up (prepareTriangle)
 };
 
 // Screen coordinates are 28.4 fixed point; depth is near/w in (0, 1], larger
@@ -71,6 +73,10 @@ struct Prim {
 	std::int16_t rowY1;
 	// Painter's key: view distance of the primitive's farthest vertex.
 	float key;
+	// With kPrepared: edges 0->2, 0->1, 1->2 of the y-sorted corners, as
+	// x at the edge's first row centre and step per row (16.16 px).
+	std::int32_t edgeX[3];
+	std::int32_t edgeStep[3];
 };
 
 enum BackgroundMode : std::uint8_t {
@@ -194,13 +200,29 @@ struct Edge {
 	std::int32_t x = 0;
 	std::int32_t step = 0;
 
-	GEA3D_INLINE void init(std::int32_t x0, std::int32_t y0, std::int32_t x1, std::int32_t y1, int row)
+	// x at the edge's first row centre and the step per row, 16.16 px.
+	static GEA3D_INLINE void setup(std::int32_t x0, std::int32_t y0, std::int32_t x1, std::int32_t y1, std::int32_t &xTop, std::int32_t &stepOut)
 	{
 		const float slope = clampFloat(static_cast<float>(x1 - x0) * reciprocal(static_cast<float>(y1 - y0)), -kMaxSlope, kMaxSlope);
 		const int top = (y0 - 8 + 15) >> 4;
-		const float xTop = (static_cast<float>(x0) + static_cast<float>(top * 16 + 8 - y0) * slope) * (1.0f / 16.0f);
-		step = roundToInt(slope * kFixedOne);
-		x = roundToInt(xTop * kFixedOne) + static_cast<std::int32_t>(static_cast<std::int64_t>(row - top) * step);
+		const float xt = (static_cast<float>(x0) + static_cast<float>(top * 16 + 8 - y0) * slope) * (1.0f / 16.0f);
+		stepOut = roundToInt(slope * kFixedOne);
+		xTop = roundToInt(xt * kFixedOne);
+	}
+
+	GEA3D_INLINE void init(std::int32_t x0, std::int32_t y0, std::int32_t x1, std::int32_t y1, int row)
+	{
+		std::int32_t xTop, stepIn;
+		setup(x0, y0, x1, y1, xTop, stepIn);
+		at(xTop, stepIn, y0, row);
+	}
+
+	// From a prepared setup: the edge starting at y0 (28.4), at `row`.
+	GEA3D_INLINE void at(std::int32_t xTop, std::int32_t stepIn, std::int32_t y0, int row)
+	{
+		const int top = (y0 - 8 + 15) >> 4;
+		step = stepIn;
+		x = xTop + static_cast<std::int32_t>(static_cast<std::int64_t>(row - top) * stepIn);
 	}
 
 	GEA3D_INLINE void advance() { x += step; }
@@ -250,7 +272,49 @@ GEA3D_INLINE Pixel packRgb(std::int32_t r, std::int32_t g, std::int32_t b)
 // A constant-colour run: paired 32-bit stores on 16-bit framebuffers.
 GEA3D_INLINE void fillPixels(Pixel *dst, int count, Pixel color)
 {
-#if GEA_PIXEL_FORMAT_IS_8888 || GEA_PIXEL_FORMAT_IS_GRAY || GEA_PIXEL_PIE_FILL16
+#if GEA_PIXEL_PIE_FILL16 && !GEA_PIXEL_FORMAT_IS_8888 && !GEA_PIXEL_FORMAT_IS_GRAY
+	// Raster rows average ~50 px, where the shared span fill spent ~90 of its
+	// ~108 cycles on a per-pixel head and tail and an 8-store pattern. Here the
+	// head and tail are at most three stores each (16/32/64-bit by address and
+	// length bits) and the vector is one broadcast load.
+	const std::uint32_t pair = static_cast<std::uint32_t>(color) | (static_cast<std::uint32_t>(color) << 16);
+	if (count >= 16) {
+		if ((reinterpret_cast<std::uintptr_t>(dst) & 2u) != 0) {
+			*dst++ = color;
+			count--;
+		}
+		if ((reinterpret_cast<std::uintptr_t>(dst) & 4u) != 0) {
+			*reinterpret_cast<std::uint32_t *>(dst) = pair;
+			dst += 2;
+			count -= 2;
+		}
+		if ((reinterpret_cast<std::uintptr_t>(dst) & 8u) != 0) {
+			std::uint32_t *wide = reinterpret_cast<std::uint32_t *>(dst);
+			wide[0] = pair;
+			wide[1] = pair;
+			dst += 4;
+			count -= 4;
+		}
+		const int vec = count >> 3;
+		std::uint32_t lane = pair;
+		const std::uint32_t *lanePtr = &lane;
+		asm volatile(
+			"ee.vldbc.32 q0, %[lane]\n"
+			"loopnez %[vec], 1f\n"
+			"ee.vst.128.ip q0, %[dst], 16\n"
+			"1:\n"
+			: [dst] "+r"(dst)
+			: [lane] "r"(lanePtr), [vec] "r"(vec)
+			: "memory");
+		count &= 7;
+	} else if ((reinterpret_cast<std::uintptr_t>(dst) & 2u) != 0 && count > 0) {
+		*dst++ = color;
+		count--;
+	}
+	std::uint32_t *wide = reinterpret_cast<std::uint32_t *>(dst);
+	for (int pairs = count >> 1; pairs > 0; pairs--) *wide++ = pair;
+	if ((count & 1) != 0) *reinterpret_cast<Pixel *>(wide) = color;
+#elif GEA_PIXEL_FORMAT_IS_8888 || GEA_PIXEL_FORMAT_IS_GRAY || GEA_PIXEL_PIE_FILL16
 	pixel::fillNative(dst, count, color);
 #else
 	if (count <= 0) return;
@@ -438,6 +502,55 @@ GEA3D_INLINE void shadePie(Pixel *dst, int count8, std::int32_t r, std::int32_t 
 		: [n] "r"(count8), [s19] "r"(s19), [s11] "r"(s11), [s18] "r"(s18), [s5] "r"(s5)
 		: "memory");
 }
+
+// ESP32-S3 PIE additive blend: dst = dst + src per RGB565 channel, each
+// saturating, eight pixels per iteration -- exactly addPixel(src, dst, 255).
+// Blue and green add in place (masked to their fields, so neither can carry
+// into the next); red is moved down a bit first so its sum stays positive in
+// a signed 16-bit lane, then clamped and moved back. vsr/vsl shift 32-bit
+// lanes: the bit that crosses into the lower lane's top is masked off, and
+// the clamped red never sets the bit that would cross back.
+// dst and src must be 16-byte aligned; count8 >= 1 groups of eight.
+alignas(16) inline std::uint16_t g_addPieMasks[24] = {
+	0x001F, 0x001F, 0x001F, 0x001F, 0x001F, 0x001F, 0x001F, 0x001F,
+	0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0,
+	0x7C00, 0x7C00, 0x7C00, 0x7C00, 0x7C00, 0x7C00, 0x7C00, 0x7C00,
+};
+GEA3D_INLINE void addPie(Pixel *dst, const Pixel *src, int count8)
+{
+	const std::uint16_t *masks = g_addPieMasks;
+	const int one = 1;
+	asm volatile(
+		"ee.vld.128.ip q5, %[masks], 16\n"
+		"ee.vld.128.ip q6, %[masks], 16\n"
+		"ee.vld.128.ip q7, %[masks], 0\n"
+		"wsr.sar %[one]\n"
+		"loopnez %[n], 1f\n"
+		"ee.vld.128.ip q0, %[src], 16\n"
+		"ee.vld.128.ip q1, %[dst], 0\n"
+		"ee.andq q2, q0, q5\n"
+		"ee.andq q3, q1, q5\n"
+		"ee.vadds.s16 q2, q2, q3\n"
+		"ee.vmin.s16 q2, q2, q5\n"
+		"ee.andq q3, q0, q6\n"
+		"ee.andq q4, q1, q6\n"
+		"ee.vadds.s16 q3, q3, q4\n"
+		"ee.vmin.s16 q3, q3, q6\n"
+		"ee.orq q2, q2, q3\n"
+		"ee.vsr.32 q0, q0\n"
+		"ee.vsr.32 q1, q1\n"
+		"ee.andq q0, q0, q7\n"
+		"ee.andq q1, q1, q7\n"
+		"ee.vadds.s16 q0, q0, q1\n"
+		"ee.vmin.s16 q0, q0, q7\n"
+		"ee.vsl.32 q0, q0\n"
+		"ee.orq q2, q2, q0\n"
+		"ee.vst.128.ip q2, %[dst], 16\n"
+		"1:\n"
+		: [dst] "+r"(dst), [src] "+r"(src), [masks] "+r"(masks)
+		: [n] "r"(count8), [one] "r"(one)
+		: "memory");
+}
 #else
 #define GEA3D_PIE_SHADE 0
 #endif
@@ -447,6 +560,14 @@ GEA3D_INLINE void shadePie(Pixel *dst, int count8, std::int32_t r, std::int32_t 
 // pixels are exactly those of the per-pixel walk.
 GEA3D_INLINE void shadePixels(Pixel *dst, int count, std::int32_t r, std::int32_t g, std::int32_t b, std::int32_t dr, std::int32_t dg, std::int32_t db)
 {
+	const int last = count - 1;
+	const int changes = levelChanges(r, r + dr * last, kShiftR) + levelChanges(g, g + dg * last, kShiftG) + levelChanges(b, b + db * last, kShiftB);
+	// A linear ramp whose ends pack to one pixel colour packs to it all the
+	// way: a fogged or gently lit face's short rows are mostly such runs.
+	if (changes == 0) {
+		fillPixels(dst, count, packRgb(r, g, b));
+		return;
+	}
 #if GEA3D_PIE_SHADE
 	// Short rows (Neon's are ~19 px) spent most of their time in the scalar
 	// head and tail around one vector group, ~400 cycles a row. Shade whole
@@ -460,8 +581,6 @@ GEA3D_INLINE void shadePixels(Pixel *dst, int count, std::int32_t r, std::int32_
 		return;
 	}
 #endif
-	const int last = count - 1;
-	const int changes = levelChanges(r, r + dr * last, kShiftR) + levelChanges(g, g + dg * last, kShiftG) + levelChanges(b, b + db * last, kShiftB);
 #if GEA3D_PIE_SHADE
 	// Long steady runs stay flat vector fills; anything busier is shaded
 	// eight pixels at a time with no per-run divides.
@@ -514,6 +633,31 @@ enum class Occlusion : std::uint8_t {
 	kPainter,   // background first, then back to front: for fast buffers
 };
 
+// Sorts a triangle's corners by y (the order drawTriangle would pick, ties
+// included, so its own sort leaves them) and sets its edges up once, on the
+// frame-build core: every band the triangle crosses otherwise re-did this,
+// ~250 cycles a triangle a band on the ESP32-S3.
+inline void prepareTriangle(Prim &p)
+{
+	if (p.type != kTriangle) return;
+	const auto swapCorners = [&p](int a, int b) {
+		std::swap(p.x[a], p.x[b]);
+		std::swap(p.y[a], p.y[b]);
+		std::swap(p.depth[a], p.depth[b]);
+		std::swap(p.r[a], p.r[b]);
+		std::swap(p.g[a], p.g[b]);
+		std::swap(p.b[a], p.b[b]);
+	};
+	if (p.y[0] > p.y[1]) swapCorners(0, 1);
+	if (p.y[0] > p.y[2]) swapCorners(0, 2);
+	if (p.y[1] > p.y[2]) swapCorners(1, 2);
+	if (p.y[2] == p.y[0]) return;  // no area: drawTriangle skips it
+	detail::Edge::setup(p.x[0], p.y[0], p.x[2], p.y[2], p.edgeX[0], p.edgeStep[0]);
+	if (p.y[1] != p.y[0]) detail::Edge::setup(p.x[0], p.y[0], p.x[1], p.y[1], p.edgeX[1], p.edgeStep[1]);
+	if (p.y[2] != p.y[1]) detail::Edge::setup(p.x[1], p.y[1], p.x[2], p.y[2], p.edgeX[2], p.edgeStep[2]);
+	p.flags |= kPrepared;
+}
+
 class Rasterizer {
 public:
 	Rasterizer(const Frame &frame, Scratch &scratch, Pixel *base, int stride, int x0, int y0, int x1, int y1, Occlusion occlusion = Occlusion::kCoverage)
@@ -521,6 +665,7 @@ public:
 	{
 		width_ = x1 - x0 + 1;
 		height_ = y1 - y0 + 1;
+		alignedRows_ = (reinterpret_cast<std::uintptr_t>(base) & 15u) == 0 && (static_cast<std::size_t>(stride) * sizeof(Pixel)) % 16u == 0;
 		if (width_ <= 0 || height_ <= 0) return;
 
 		if (!painter_) bindCoverage();
@@ -596,6 +741,9 @@ private:
 	Scratch &scratch_;
 	Pixel *base_;
 	int stride_;
+	// Every row starts on a 16-byte boundary: addRunPie may widen a span to
+	// whole vector groups within its row.
+	bool alignedRows_ = false;
 	int x0_, y0_, x1_, y1_;
 	int width_ = 0;
 	int height_ = 0;
@@ -717,7 +865,7 @@ private:
 		if (rowFirst > rowLast) return;
 
 		const SpanState span = spanState(prim, blendPass, i0, i1, i2);
-		const Walk walk{X0, Y0, X1, Y1, X2, Y2, rowFirst, rowLast, ySplit, cross > 0};
+		const Walk walk{X0, Y0, X1, Y1, X2, Y2, rowFirst, rowLast, ySplit, cross > 0, (prim.flags & kPrepared) ? &prim : nullptr};
 
 		// Painter's order without blending or depth: spans go straight to the band.
 		if (painter_ && !span.blend && !useDepth_) {
@@ -740,6 +888,7 @@ private:
 		std::int32_t x0, y0, x1, y1, x2, y2;
 		int rowFirst, rowLast, ySplit;
 		bool longLeft;
+		const Prim *prepared;  // edges set up by prepareTriangle, or null
 	};
 
 	// Calls emit(row, xa, xb) for the pixels [xa, xb) of each row, clipped to
@@ -748,16 +897,19 @@ private:
 	GEA3D_INLINE void walkRows(const Walk &w, Emit emit)
 	{
 		detail::Edge longEdge;
-		longEdge.init(w.x0, w.y0, w.x2, w.y2, w.rowFirst);
+		if (w.prepared) longEdge.at(w.prepared->edgeX[0], w.prepared->edgeStep[0], w.y0, w.rowFirst);
+		else longEdge.init(w.x0, w.y0, w.x2, w.y2, w.rowFirst);
 		detail::Edge shortEdge;
 		int row = w.rowFirst;
 		if (row < w.ySplit) {
-			shortEdge.init(w.x0, w.y0, w.x1, w.y1, row);
+			if (w.prepared) shortEdge.at(w.prepared->edgeX[1], w.prepared->edgeStep[1], w.y0, row);
+			else shortEdge.init(w.x0, w.y0, w.x1, w.y1, row);
 			row = walkSection(longEdge, shortEdge, w.longLeft, row, detail::minInt(w.ySplit - 1, w.rowLast), emit);
 		}
 		if (row > w.rowLast || w.y2 == w.y1) return;
 
-		shortEdge.init(w.x1, w.y1, w.x2, w.y2, row);
+		if (w.prepared) shortEdge.at(w.prepared->edgeX[2], w.prepared->edgeStep[2], w.y1, row);
+		else shortEdge.init(w.x1, w.y1, w.x2, w.y2, row);
 		walkSection(longEdge, shortEdge, w.longLeft, row, w.rowLast, emit);
 	}
 
@@ -1020,6 +1172,18 @@ private:
 		const Pixel flat = span.prim->color;
 		const int alpha = span.prim->alpha;
 		const bool add = (span.prim->flags & kAdd) != 0;
+#if !(GEA_PIXEL_FORMAT_IS_8888 || GEA_PIXEL_FORMAT_IS_GRAY)
+		if (add && !span.depthTest && !span.depthWrite) {
+#if GEA3D_PIE_SHADE && !GEA_EMBEDDED_PIXEL_PANEL_ENDIAN
+			if (alpha == 255 && alignedRows_ && (!span.smooth || (inRange(r, dr, last) && inRange(g, dg, last) && inRange(b, db, last)))) {
+				addRunPie(dst, count, span.smooth, flat, r, g, b, dr, dg, db);
+				return;
+			}
+#endif
+			addRun(dst, count, span.smooth, flat, r, g, b, dr, dg, db, alpha);
+			return;
+		}
+#endif
 		for (int i = 0; i < count; i++) {
 			bool visible = true;
 			if (span.depthTest) {
@@ -1039,6 +1203,104 @@ private:
 			b += db;
 		}
 	}
+
+#if !(GEA_PIXEL_FORMAT_IS_8888 || GEA_PIXEL_FORMAT_IS_GRAY)
+	// An additive run on RGB565: the same sums as addPixel(packRgb(..)) per
+	// pixel, with the loop invariants hoisted and the 565 channels of the
+	// source taken straight from the colour ramp instead of packed and
+	// unpacked again. Pixels whose scaled source is black are left alone.
+	static void addRun(Pixel *dst, int count, bool smooth, Pixel flat, std::int32_t r, std::int32_t g, std::int32_t b, std::int32_t dr, std::int32_t dg, std::int32_t db, int alpha)
+	{
+		const int scale = alpha + (alpha >> 7);
+		if (!smooth) {
+			const std::uint32_t f = pixel::toRgb565(flat);
+			const int ar = (static_cast<int>(f >> 11) * scale) >> 8;
+			const int ag = (static_cast<int>((f >> 5) & 63) * scale) >> 8;
+			const int ab = (static_cast<int>(f & 31) * scale) >> 8;
+			if ((ar | ag | ab) == 0) return;
+			for (int i = 0; i < count; i++) dst[i] = addRgb565(dst[i], ar, ag, ab);
+			return;
+		}
+		for (int i = 0; i < count; i++) {
+			const int ar = ((clampColor(r) >> 19) * scale) >> 8;
+			const int ag = ((clampColor(g) >> 18) * scale) >> 8;
+			const int ab = ((clampColor(b) >> 19) * scale) >> 8;
+			r += dr;
+			g += dg;
+			b += db;
+			if ((ar | ag | ab) == 0) continue;
+			dst[i] = addRgb565(dst[i], ar, ag, ab);
+		}
+	}
+
+#if GEA3D_PIE_SHADE && !GEA_EMBEDDED_PIXEL_PANEL_ENDIAN
+	// addRun at full opacity, eight pixels at a time between a scalar head
+	// (to 16-byte alignment) and tail: the source ramp is shaded into an
+	// aligned row (shadePie: the caller checked its channels stay in range),
+	// then added in. Pixel for pixel the same as addRun.
+	static void addRunPie(Pixel *dst, int count, bool smooth, Pixel flat, std::int32_t r, std::int32_t g, std::int32_t b, std::int32_t dr, std::int32_t dg, std::int32_t db)
+	{
+		if (count < 4) {
+			addOpaqueRamp(dst, count, smooth, flat, r, g, b, dr, dg, db);
+			return;
+		}
+		// Whole aligned groups only, from the 16-byte boundary at or before the
+		// span: lanes outside it add zero, a saturating add of zero leaves a
+		// pixel as it was, and band rows are 16-byte aligned, so the widened
+		// groups stay in this row. The scalar head and tail this replaces were
+		// ~10 cycles a pixel, most of a ~40 px glow row.
+		const int lead = static_cast<int>((reinterpret_cast<std::uintptr_t>(dst) & 15u) >> 1);
+		Pixel *const aligned = dst - lead;
+		const int total = lead + count;
+		alignas(16) Pixel src[64];
+		for (int done = 0; done < total;) {
+			const int chunk = detail::minInt(total - done, 64);
+			const int groups = (chunk + 7) >> 3;
+			const int first = done - lead;  // span index of src[0]
+			if (smooth) detail::shadePie(src, groups, r + dr * first, g + dg * first, b + db * first, dr, dg, db);
+			else detail::fillPixels(src, groups << 3, flat);
+			if (done == 0)
+				for (int k = 0; k < lead; k++) src[k] = 0;
+			for (int k = chunk; k < (groups << 3); k++) src[k] = 0;
+			detail::addPie(aligned + done, src, groups);
+			done += groups << 3;
+		}
+	}
+#endif
+
+	// addRun at full opacity with every channel of the ramp in range: no
+	// clamps, no scale, no zero test -- the scalar head and tail (and the
+	// short rows) of addRunPie.
+	static GEA3D_INLINE void addOpaqueRamp(Pixel *dst, int count, bool smooth, Pixel flat, std::int32_t r, std::int32_t g, std::int32_t b, std::int32_t dr, std::int32_t dg, std::int32_t db)
+	{
+		if (!smooth) {
+			const std::uint32_t f = pixel::toRgb565(flat);
+			r = static_cast<std::int32_t>(f >> 11) << 19;
+			g = static_cast<std::int32_t>((f >> 5) & 63) << 18;
+			b = static_cast<std::int32_t>(f & 31) << 19;
+			dr = dg = db = 0;
+		}
+		for (int i = 0; i < count; i++) {
+			const std::uint32_t c = pixel::toRgb565(dst[i]);
+			const int rr = detail::minInt(31, static_cast<int>(c >> 11) + (r >> 19));
+			const int gg = detail::minInt(63, static_cast<int>((c >> 5) & 63) + (g >> 18));
+			const int bb = detail::minInt(31, static_cast<int>(c & 31) + (b >> 19));
+			dst[i] = pixel::fromRgb565(static_cast<std::uint16_t>((rr << 11) | (gg << 5) | bb));
+			r += dr;
+			g += dg;
+			b += db;
+		}
+	}
+
+	static GEA3D_INLINE Pixel addRgb565(Pixel bg, int ar, int ag, int ab)
+	{
+		const std::uint32_t c = pixel::toRgb565(bg);
+		const int rr = detail::minInt(31, static_cast<int>(c >> 11) + ar);
+		const int gg = detail::minInt(63, static_cast<int>((c >> 5) & 63) + ag);
+		const int bb = detail::minInt(31, static_cast<int>(c & 31) + ab);
+		return pixel::fromRgb565(static_cast<std::uint16_t>((rr << 11) | (gg << 5) | bb));
+	}
+#endif
 
 	static GEA3D_INLINE int absStep(std::int32_t step) { return step < 0 ? -step : step; }
 
