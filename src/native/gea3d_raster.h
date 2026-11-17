@@ -447,6 +447,19 @@ GEA3D_INLINE void shadePie(Pixel *dst, int count8, std::int32_t r, std::int32_t 
 // pixels are exactly those of the per-pixel walk.
 GEA3D_INLINE void shadePixels(Pixel *dst, int count, std::int32_t r, std::int32_t g, std::int32_t b, std::int32_t dr, std::int32_t dg, std::int32_t db)
 {
+#if GEA3D_PIE_SHADE
+	// Short rows (Neon's are ~19 px) spent most of their time in the scalar
+	// head and tail around one vector group, ~400 cycles a row. Shade whole
+	// groups into an aligned scratch row and copy the span out: lanes past the
+	// span (whose channels may leave 0..0xFFFFFF) stay in their own lanes and
+	// are dropped, so the span is exactly the scalar walk's.
+	if (count >= 4 && count <= 64) {
+		alignas(16) Pixel row[64];
+		shadePie(row, (count + 7) >> 3, r, g, b, dr, dg, db);
+		std::memcpy(dst, row, static_cast<std::size_t>(count) * sizeof(Pixel));
+		return;
+	}
+#endif
 	const int last = count - 1;
 	const int changes = levelChanges(r, r + dr * last, kShiftR) + levelChanges(g, g + dg * last, kShiftG) + levelChanges(b, b + db * last, kShiftB);
 #if GEA3D_PIE_SHADE
@@ -486,6 +499,7 @@ GEA3D_INLINE void shadePixels(Pixel *dst, int count, std::int32_t r, std::int32_
 }
 
 }  // namespace detail
+
 
 // The primitives touching one band, in sorted order (indices into
 // Frame::prims), the first `opaque` of them opaque.

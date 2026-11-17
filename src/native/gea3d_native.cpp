@@ -16,6 +16,7 @@
 #include "pixel.h"
 
 #include <algorithm>
+#include <atomic>
 #include <climits>
 #include <cmath>
 #include <cstring>
@@ -414,7 +415,13 @@ std::uint32_t g_frameSerial[2] = {0, 0};
 // Per frame slot, a content hash of each kBandHashRows-row band: what its
 // primitives draw there, in draw order. A composited frame marks dirty only
 // the bands that differ from the frame on screen.
+// The band height is the painter's strip height when it stages strips
+// (g_stripRowsHint), so dirty runs start where strips do and every strip
+// reads one prebuilt band list; 8 rows until it is known.
 constexpr int kBandHashRows = 8;
+std::atomic<int> g_stripRowsHint{0};
+int g_bandHashRows[2] = {kBandHashRows, kBandHashRows};
+int g_shownBandHashRows = kBandHashRows;
 std::vector<std::uint64_t> g_bandHash[2];
 std::vector<std::uint64_t> g_shownBandHash;
 bool g_shownBandHashValid = false;
@@ -1622,7 +1629,21 @@ struct StripLists {
 	int rows = 0;
 	Bands bands;
 };
-StripLists g_stripLists;
+// One per frame slot: the build core fills the building frame's lists for
+// the strip height the painter last used (g_stripRowsHint), so the painter
+// core no longer spends ~0.75 ms a frame on them.
+StripLists g_stripLists[2];
+void prebuildStripLists(const raster::Frame &frame, int slot)
+{
+	const int rows = g_stripRowsHint.load(std::memory_order_relaxed);
+	if (rows <= 0 || slot < 0 || slot > 1) return;
+	StripLists &cache = g_stripLists[slot];
+	cache.bands.rows = rows;
+	buildBandLists(frame, 0, frame.height - 1, cache.bands);
+	cache.frame = &frame;
+	cache.serial = g_frameSerial[slot];
+	cache.rows = rows;
+}
 
 bool rasterizePainterInPlace(const raster::Frame &frame, Pixel *base, int stride, int x0, int y0, int x1, int y1)
 {
@@ -1632,21 +1653,34 @@ bool rasterizePainterInPlace(const raster::Frame &frame, Pixel *base, int stride
 	if (x0 > x1 || y0 > y1) return true;
 
 	const int rows = y1 - y0 + 1;
+	// The tallest full-width strip is the staging height (a run's first and
+	// last strips can be shorter; narrower boxes stage taller strips): the
+	// next builds hash bands and prebuild lists at it.
+	if (x0 == 0 && x1 == frame.width - 1 && rows > g_stripRowsHint.load(std::memory_order_relaxed)) g_stripRowsHint.store(rows, std::memory_order_relaxed);
 	const std::ptrdiff_t slot = &frame - g_renderer.frames;
 	raster::BandList list{nullptr, 0, 0};
-	if (slot >= 0 && slot < 2 && y0 % rows == 0) {
-		StripLists &cache = g_stripLists;
+	bool listed = false;
+	if (slot >= 0 && slot < 2) {
+		StripLists &cache = g_stripLists[slot];
 		const std::uint32_t serial = g_frameSerial[slot];
-		if (cache.frame != &frame || cache.serial != serial || cache.rows != rows) {
+		bool fresh = cache.frame == &frame && cache.serial == serial && cache.rows > 0;
+		if (!fresh && y0 % rows == 0) {
 			cache.bands.rows = rows;
 			buildBandLists(frame, 0, frame.height - 1, cache.bands);
 			cache.frame = &frame;
 			cache.serial = serial;
 			cache.rows = rows;
+			fresh = true;
 		}
-		// A short last strip reads its band's list: the extra primitives clip away.
-		list = bandList(cache.bands, y0 / rows);
-	} else {
+		// Any strip inside one band reads that band's list (the build core
+		// made it, at the staging height); the extra primitives clip away. A
+		// strip across two bands (a UI dirty box moved its start) scans.
+		if (fresh && y0 / cache.rows == y1 / cache.rows) {
+			list = bandList(cache.bands, y0 / cache.rows);
+			listed = true;
+		}
+	}
+	if (!listed) {
 		std::vector<std::int32_t> &items = g_renderer.bands.items;
 		items.clear();
 		int opaque = 0;
@@ -1784,7 +1818,8 @@ bool presentUnderlay(raster::Frame &frame, const std::vector<std::uint64_t> *has
 	int runFirst[kMaxRuns];
 	int runLast[kMaxRuns];
 	int runs = 0;
-	if (hash && g_shownBandHashValid && g_shownBandHash.size() == hash->size() && gea::framework::display::Underlay::active()) {
+	const int hashRows = hash ? g_bandHashRows[hash == &g_bandHash[1] ? 1 : 0] : kBandHashRows;
+	if (hash && g_shownBandHashValid && g_shownBandHashRows == hashRows && g_shownBandHash.size() == hash->size() && gea::framework::display::Underlay::active()) {
 		const int bands = static_cast<int>(hash->size());
 		for (int b = 0; b < bands; b++) {
 			if ((*hash)[b] == g_shownBandHash[b]) continue;
@@ -1798,8 +1833,8 @@ bool presentUnderlay(raster::Frame &frame, const std::vector<std::uint64_t> *has
 			}
 		}
 		for (int k = 0; k < runs; k++) {
-			runFirst[k] *= kBandHashRows;
-			runLast[k] = std::min(frame.height - 1, (runLast[k] + 1) * kBandHashRows - 1);
+			runFirst[k] *= hashRows;
+			runLast[k] = std::min(frame.height - 1, (runLast[k] + 1) * hashRows - 1);
 		}
 	} else {
 		runFirst[0] = 0;
@@ -1808,6 +1843,7 @@ bool presentUnderlay(raster::Frame &frame, const std::vector<std::uint64_t> *has
 	}
 	if (hash) {
 		g_shownBandHash = *hash;
+		g_shownBandHashRows = hashRows;
 		g_shownBandHashValid = true;
 	} else {
 		g_shownBandHashValid = false;
@@ -2319,9 +2355,9 @@ std::uint64_t primHash(const raster::Prim &p, bool opaque, bool withDepth, bool 
 
 // Band hashes of a sorted frame. Depth matters only to a depth-tested frame,
 // and the sort key only where blended primitives interleave by it.
-void hashBands(const raster::Frame &frame, std::vector<std::uint64_t> &out)
+void hashBands(const raster::Frame &frame, std::vector<std::uint64_t> &out, int bandRows)
 {
-	const int bands = frame.height > 0 ? (frame.height + kBandHashRows - 1) / kBandHashRows : 0;
+	const int bands = frame.height > 0 ? (frame.height + bandRows - 1) / bandRows : 0;
 	std::uint64_t seed = mixHash(0x84222325CBF29CE4ull, static_cast<std::uint64_t>(frame.width) << 32 | static_cast<std::uint32_t>(frame.height));
 	const raster::Background &bg = frame.background;
 	seed = mixHash(seed, static_cast<std::uint64_t>(bg.mode) | static_cast<std::uint64_t>(bg.top[0]) << 8 | static_cast<std::uint64_t>(bg.top[1]) << 16 |
@@ -2336,7 +2372,7 @@ void hashBands(const raster::Frame &frame, std::vector<std::uint64_t> &out)
 		const int last = minInt(static_cast<std::int16_t>(frame.rows[i] >> 16), frame.height - 1);
 		if (first > last) continue;
 		const std::uint64_t h = primHash(frame.prims[frame.order[static_cast<std::size_t>(i)]], i < frame.opaqueCount, withDepth, withKey);
-		for (int b = first / kBandHashRows; b <= last / kBandHashRows; b++) out[static_cast<std::size_t>(b)] = mixHash(out[static_cast<std::size_t>(b)], h);
+		for (int b = first / bandRows; b <= last / bandRows; b++) out[static_cast<std::size_t>(b)] = mixHash(out[static_cast<std::size_t>(b)], h);
 	}
 }
 
@@ -2363,8 +2399,15 @@ void buildFrame(int scene, int camera, int width, int height)
 
 	sortFrame();
 	r.stats.primitives = frame.count;
-	hashBands(frame, g_bandHash[r.building]);
+	{
+		const int hint = g_stripRowsHint.load(std::memory_order_relaxed);
+		g_bandHashRows[r.building] = hint >= 4 && hint <= 32 ? hint : kBandHashRows;
+	}
+	hashBands(frame, g_bandHash[r.building], g_bandHashRows[r.building]);
 	g_frameSerial[r.building]++;
+#if GEA3D_ASYNC_PRESENT
+	prebuildStripLists(frame, r.building);
+#endif
 }
 }  // namespace
 
