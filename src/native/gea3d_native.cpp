@@ -1573,6 +1573,24 @@ void rasterizeInto(const raster::Frame &frame, Pixel *base, int stride, int x0, 
 
 	Bands &bands = g_renderer.bands;
 	const int width = x1 - x0 + 1;
+#if GEA3D_ASYNC_PRESENT && !defined(GEA3D_BAND_ROWS)
+	// A target in PSRAM (the ESP32-P4's swapped scanout buffers) takes the
+	// raster in bands of internal RAM, painter's order, each copied out in one
+	// sequential pass: coverage mode straight into PSRAM cost the CrowPanel 5.0
+	// ~65 ms of a Lantern frame, the same figure painter's order in fast
+	// memory cut to ~20 ms on the 7.0.
+	if (width > bands.width && !esp_ptr_internal(base + static_cast<std::ptrdiff_t>(y0) * stride + x0)) {
+		constexpr int kEspBandRows = 32;
+		const int bandWidth = std::max(width, frame.width);
+		Pixel *pixels = static_cast<Pixel *>(heap_caps_aligned_alloc(16, static_cast<std::size_t>(bandWidth) * kEspBandRows * sizeof(Pixel), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+		if (pixels) {
+			if (bands.pixels) heap_caps_free(bands.pixels);
+			bands.pixels = pixels;
+			bands.width = bandWidth;
+			bands.rows = kEspBandRows;
+		}
+	}
+#endif
 	if (!bands.pixels || width > bands.width) {
 		raster::Rasterizer rasterizer(frame, g_renderer.scratch, base, stride, x0, y0, x1, y1);
 		rasterizer.run();
