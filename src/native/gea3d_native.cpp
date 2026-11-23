@@ -1886,6 +1886,47 @@ void paintUnderlay(int x0, int y0, int x1, int y1, void *user)
 	rasterizeInto(*static_cast<const raster::Frame *>(user), canvas->pixels(), stride, x0, y0, x1, y1);
 }
 
+// Engine callback for targets that record draw commands: the last frame's
+// background and primitives in runPainter's order, without a depth buffer.
+void describeUnderlay(gea::framework::display::Underlay::Sink &sink, void *user)
+{
+	using Primitive = gea::framework::display::Underlay::Primitive;
+	const raster::Frame &frame = *static_cast<const raster::Frame *>(user);
+	const auto rgb = [](const std::uint8_t *c) { return static_cast<std::uint32_t>(c[0]) << 16 | static_cast<std::uint32_t>(c[1]) << 8 | c[2]; };
+	const raster::Background &bg = frame.background;
+	if (bg.mode != raster::kBackgroundNone) sink.background(rgb(bg.top), rgb(bg.mode == raster::kBackgroundGradient ? bg.bottom : bg.top));
+
+	const auto emit = [&sink, &frame](std::int32_t index) {
+		const Prim &prim = frame.prims[index];
+		Primitive out;
+		const bool blend = (prim.flags & raster::kBlend) != 0;
+		for (int i = 0; i < 3; i++) {
+			out.x[i] = prim.x[i];
+			out.y[i] = prim.y[i];
+			out.color[i] = static_cast<std::uint32_t>(prim.r[i]) << 16 | static_cast<std::uint32_t>(prim.g[i]) << 8 | prim.b[i];
+		}
+		out.kind = prim.type == raster::kLine ? Primitive::kLine : Primitive::kTriangle;
+		out.blend = blend && (prim.flags & raster::kAdd) != 0 ? Primitive::kAdd : Primitive::kSourceOver;
+		out.alpha = blend ? prim.alpha : 255;
+		out.width = prim.width;
+		sink.primitive(out);
+	};
+	const std::int32_t *order = frame.order.data();
+	const std::int32_t *layers = frame.layers.data();
+	int opaque = frame.opaqueCount - 1;
+	int blended = frame.opaqueCount;
+	const int count = frame.opaqueCount + frame.blendCount;
+	while (opaque >= 0 || blended < count) {
+		bool takeBlended = opaque < 0;
+		if (!takeBlended && blended < count) {
+			const std::int32_t o = order[opaque];
+			const std::int32_t b = order[blended];
+			takeBlended = layers[b] < layers[o] || (layers[b] == layers[o] && frame.prims[b].key > frame.prims[o].key);
+		}
+		emit(takeBlended ? order[blended++] : order[opaque--]);
+	}
+}
+
 // The display's draw canvas for state only (the dirty box), where the target
 // splits it from pixel access. A double-buffered panel readies its back buffer
 // the first time Display::canvas() is asked for, copying every stale pixel in
@@ -1947,7 +1988,7 @@ bool presentUnderlay(raster::Frame &frame, const std::vector<std::uint64_t> *has
 		g_shownBandHashValid = false;
 	}
 
-	gea::framework::display::Underlay::set(paintUnderlay, &frame, 0, 0, frame.width - 1, frame.height - 1);
+	gea::framework::display::Underlay::set(paintUnderlay, &frame, 0, 0, frame.width - 1, frame.height - 1, describeUnderlay);
 	// A background colour fills the frame before any triangle: every pixel of
 	// it is written, so the UI's refresh need not restore what was there.
 	gea::framework::display::Underlay::setOpaque(frame.background.mode != raster::kBackgroundNone);
