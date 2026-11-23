@@ -1664,6 +1664,84 @@ void prebuildStripLists(const raster::Frame &frame, int slot)
 	cache.rows = rows;
 }
 
+// Second-core share of a staged strip (rasterizePainterInPlace). Lantern on
+// the CrowPanel 5.0 spent ~18 ms a frame painting strips on one core while
+// the other built the next frame in ~14 ms; the helper paints the lower 3/8
+// of each strip there, above the build, and Lantern went from ~27 to ~30 fps.
+// Measured and dropped: half of each strip (the helper's raster and the build
+// contend for the shared cache: the build took 32 ms instead of 21), and
+// chunks claimed by work stealing at or below the build's priority (the
+// helper got 16-20% of the chunks, mid-chunk preemption left this core
+// waiting on it, and three rasterizers per strip re-walked the band list).
+#ifndef GEA3D_SPLIT_STRIPS
+#if defined(CONFIG_IDF_TARGET_ESP32P4)
+#define GEA3D_SPLIT_STRIPS 1
+#else
+#define GEA3D_SPLIT_STRIPS 0
+#endif
+#endif
+#ifndef GEA3D_SPLIT_EIGHTHS
+#define GEA3D_SPLIT_EIGHTHS 3
+#endif
+constexpr int kSplitMinRows = 8;
+struct SplitJob {
+	const raster::Frame *frame;
+	raster::BandList list;
+	Pixel *base;
+	int stride, x0, y0, x1, y1;
+};
+SplitJob g_splitJob{};
+raster::Scratch g_splitScratch;
+SemaphoreHandle_t g_splitWork = nullptr;
+SemaphoreHandle_t g_splitDone = nullptr;
+TaskHandle_t g_splitTask = nullptr;
+bool g_splitFailed = false;
+
+void splitTaskMain(void *)
+{
+	for (;;) {
+		xSemaphoreTake(g_splitWork, portMAX_DELAY);
+		const SplitJob job = g_splitJob;
+		raster::Rasterizer lower(*job.frame, g_splitScratch, job.base, job.stride, job.x0, job.y0, job.x1, job.y1, raster::Occlusion::kPainter);
+		lower.runPainter(job.list);
+		xSemaphoreGive(g_splitDone);
+	}
+}
+
+bool ensureSplitTask()
+{
+	if (!GEA3D_SPLIT_STRIPS || portNUM_PROCESSORS < 2) return false;
+	if (g_splitTask) return true;
+	if (g_splitFailed) return false;
+	g_splitFailed = true;
+	g_splitWork = xSemaphoreCreateBinary();
+	g_splitDone = xSemaphoreCreateBinary();
+	if (!g_splitWork || !g_splitDone) return false;
+	const BaseType_t core = xPortGetCoreID() == 0 ? 1 : 0;
+	const UBaseType_t priority = uxTaskPriorityGet(nullptr) + 1;
+	if (xTaskCreatePinnedToCore(splitTaskMain, "gea3d_split", 6144, nullptr, priority, &g_splitTask, core) != pdPASS || !g_splitTask) {
+		g_splitTask = nullptr;
+		return false;
+	}
+	g_splitFailed = false;
+	return true;
+}
+
+// Paints rows y0..y1 of a staged strip with the helper; false when the strip
+// is too short to share or there is no helper.
+bool paintShared(const raster::Frame &frame, const raster::BandList &list, Pixel *base, int stride, int x0, int y0, int x1, int y1)
+{
+	const int rows = y1 - y0 + 1;
+	if (rows < kSplitMinRows || !ensureSplitTask()) return false;
+	const int mid = y1 + 1 - (rows * GEA3D_SPLIT_EIGHTHS) / 8;
+	g_splitJob = SplitJob{&frame, list, base, stride, x0, mid, x1, y1};
+	xSemaphoreGive(g_splitWork);
+	raster::Rasterizer upper(frame, g_renderer.scratch, base, stride, x0, y0, x1, mid - 1, raster::Occlusion::kPainter);
+	upper.runPainter(list);
+	xSemaphoreTake(g_splitDone, portMAX_DELAY);
+	return true;
+}
+
 bool rasterizePainterInPlace(const raster::Frame &frame, Pixel *base, int stride, int x0, int y0, int x1, int y1)
 {
 	if (!esp_ptr_internal(base + static_cast<std::ptrdiff_t>(y0) * stride + x0)) return false;
@@ -1712,6 +1790,7 @@ bool rasterizePainterInPlace(const raster::Frame &frame, Pixel *base, int stride
 		}
 		list = raster::BandList{items.data(), static_cast<int>(items.size()), opaque};
 	}
+	if (paintShared(frame, list, base, stride, x0, y0, x1, y1)) return true;
 	raster::Rasterizer rasterizer(frame, g_renderer.scratch, base, stride, x0, y0, x1, y1, raster::Occlusion::kPainter);
 	rasterizer.runPainter(list);
 	return true;
