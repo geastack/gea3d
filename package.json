@@ -1,6 +1,6 @@
 {
   "name": "@geastack/gea3d",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "type": "module",
   "description": "Typed Three.js-style scene graph and native software 3D renderer for Gea devices",
   "exports": {
